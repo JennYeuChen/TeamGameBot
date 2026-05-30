@@ -272,6 +272,27 @@ async def setup_game(ctx):
     embed = discord.Embed(title="⚔️ 陣營對抗賽 - 隊伍招募中！", description="點擊下方按鈕自動分隊！發言賺取積分吧！", color=discord.Color.dark_magenta())
     await ctx.send(embed=embed, view=AutoBalanceView())
 
+@bot.command()
+@commands.is_owner()
+async def load_json(ctx):
+    await ctx.send("請上傳包含 JSON 資料的檔案！")
+    
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel and m.attachments
+    
+    try:
+        msg = await bot.wait_for('message', check=check, timeout=60.0)
+        attachment = msg.attachments[0]
+        content = await attachment.read()
+        new_data = json.loads(content.decode('utf-8'))
+        
+        global game_data
+        game_data = new_data
+        save_data()
+        await ctx.send("✅ 資料已強制覆蓋並同步至雲端！")
+    except Exception as e:
+        await ctx.send(f"❌ 載入失敗：{e}")
+
 # --- 5. 查詢個人資產與戰況：!status ---
 @bot.command(name="status")
 async def status(ctx):
