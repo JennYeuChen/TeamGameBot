@@ -15,10 +15,12 @@ def home():
     return "機器人正在雲端運行中！"
 
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
-threading.Thread(target=run_flask, daemon=True).start()
+    port = int(os.environ.get("PORT", 10000))
+    # 加入 use_reloader=False 避免 Flask 自己重複啟動導致衝突
+    try:
+        app.run(host="0.0.0.0", port=port, use_reloader=False)
+    except Exception as e:
+        print(f"Flask 啟動失敗 (可能已在運行): {e}")
 
 # 設定機器人
 intents = discord.Intents.default()
@@ -505,40 +507,21 @@ class BattleItemsView(View):
 # --- 7. 機器人上線通知 ---
 @bot.event
 async def on_ready():
-    print(f"陣營經濟對抗賽機器人已上線：{bot.user.name}")
+    print(f"機器人已啟動：{bot.user}")
     
-    # 【強效同步】：重啟後的第一件事，從 Google Sheet 抓回正確總分
-    try:
-        if SHEET_CONNECTED:
-            # 從 Google Sheet 抓取分數並寫入 game_data
+    # 強制從 Sheets 讀取分數並覆蓋 game_data
+    if SHEET_CONNECTED:
+        try:
+            # 讀取 Sheet 上的分數
             red_str = sheet.acell("H1").value
             blue_str = sheet.acell("H2").value
             
-            # 解析字串 (例如 "紅隊總分: 123" -> 123)
-            if red_str and ": " in red_str:
-                game_data['teams']['red'] = int(red_str.split(': ')[1])
-            if blue_str and ": " in blue_str:
-                game_data['teams']['blue'] = int(blue_str.split(': ')[1])
-            
-            # 同步使用者資料
-            all_rows = sheet.get_all_values()
-            if len(all_rows) > 1:
-                for row in all_rows[1:]:
-                    if len(row) >= 4:
-                        uid = row[0]
-                        points = int(row[1]) if row[1] else 0
-                        total_msg = int(row[2]) if row[2] else 0
-                        daily_msg = int(row[3]) if row[3] else 0
-                        game_data['users'][uid] = {
-                            "points": points,
-                            "total_msg": total_msg,
-                            "daily_msg": daily_msg
-                        }
-            
-            save_data()
-            print("【系統】已從雲端找回完整資料！")
-    except Exception as e:
-        print(f"【系統】同步失敗，使用本地 JSON 資料：{e}")
+            # 確保正確解析 (處理 "紅隊總分: 2345" 的格式)
+            game_data['teams']['red'] = int(red_str.split(': ')[1])
+            game_data['teams']['blue'] = int(blue_str.split(': ')[1])
+            print("【系統】已強制從雲端同步分數回記憶體！")
+        except Exception as e:
+            print(f"【同步失敗】: {e}")
     
     if not reset_daily_stats.is_running():
         reset_daily_stats.start()
