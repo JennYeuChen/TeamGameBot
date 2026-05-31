@@ -88,30 +88,26 @@ def save_data():
 
 def sync_to_sheets():
     try:
-        rows = []
+        if not SHEET_CONNECTED:
+            return
+        
+        # 準備資料
+        data = []
         for uid, udata in game_data.get("users", {}).items():
-            rows.append([
+            data.append([
                 str(uid),
                 udata.get("points", 0),
                 udata.get("total_msg", 0),
                 udata.get("daily_msg", 0)
             ])
         
-        if rows:
-            # 🟢 修正：先確認表格列數夠不夠，不夠就自動加，避免 delete/insert 爆掉
-            current_row_count = len(sheet.get_all_values())
-            needed_rows = len(rows) + 10
-            if current_row_count < needed_rows:
-                sheet.add_rows(needed_rows - current_row_count)
-
-            # 清除舊數據（保留第 1 列標題，清除到目前表格的底）
-            sheet.delete_rows(2, max(current_row_count, 10))
-            # 批量寫入
-            sheet.insert_rows(rows, row=2)
-            
-            # 分數同步
-            sheet.update_acell("H1", f"紅隊總分: {game_data['teams']['red']}")
-            sheet.update_acell("H2", f"藍隊總分: {game_data['teams']['blue']}")
+        # 不要刪除，直接從第 2 行開始覆蓋寫入
+        if data:
+            sheet.update(range_name='A2', values=data)
+        
+        # 分數同步
+        sheet.update_acell("H1", f"紅隊總分: {game_data['teams']['red']}")
+        sheet.update_acell("H2", f"藍隊總分: {game_data['teams']['blue']}")
     except Exception as e:
         print(f"📊 【雲端同步錯誤】: {e}")
 
@@ -510,13 +506,52 @@ class BattleItemsView(View):
 @bot.event
 async def on_ready():
     print(f"陣營經濟對抗賽機器人已上線：{bot.user.name}")
+    
+    # 【強效同步】：重啟後的第一件事，從 Google Sheet 抓回正確總分
+    try:
+        if SHEET_CONNECTED:
+            # 從 Google Sheet 抓取分數並寫入 game_data
+            red_str = sheet.acell("H1").value
+            blue_str = sheet.acell("H2").value
+            
+            # 解析字串 (例如 "紅隊總分: 123" -> 123)
+            if red_str and ": " in red_str:
+                game_data['teams']['red'] = int(red_str.split(': ')[1])
+            if blue_str and ": " in blue_str:
+                game_data['teams']['blue'] = int(blue_str.split(': ')[1])
+            
+            # 同步使用者資料
+            all_rows = sheet.get_all_values()
+            if len(all_rows) > 1:
+                for row in all_rows[1:]:
+                    if len(row) >= 4:
+                        uid = row[0]
+                        points = int(row[1]) if row[1] else 0
+                        total_msg = int(row[2]) if row[2] else 0
+                        daily_msg = int(row[3]) if row[3] else 0
+                        game_data['users'][uid] = {
+                            "points": points,
+                            "total_msg": total_msg,
+                            "daily_msg": daily_msg
+                        }
+            
+            save_data()
+            print("【系統】已從雲端找回完整資料！")
+    except Exception as e:
+        print(f"【系統】同步失敗，使用本地 JSON 資料：{e}")
+    
     if not reset_daily_stats.is_running():
         reset_daily_stats.start()
 
 # 🟢 修正：本機抓引號內的 Token，上雲端 Render 會自動抓環境變數中的 DISCORD_TOKEN
 TOKEN = os.environ.get("DISCORD_TOKEN")
 
-if not TOKEN:
-    print("❌ 錯誤：找不到 DISCORD_TOKEN，請檢查 Render 環境變數設定！")
-else:
-    bot.run(TOKEN)
+if __name__ == "__main__":
+    # 建立一個執行緒來跑 Flask，這樣就不會擋住下面的 bot.run
+    web_thread = threading.Thread(target=run_flask, daemon=True)
+    web_thread.start()
+    
+    if not TOKEN:
+        print("❌ 錯誤：找不到 DISCORD_TOKEN，請檢查 Render 環境變數設定！")
+    else:
+        bot.run(TOKEN)
