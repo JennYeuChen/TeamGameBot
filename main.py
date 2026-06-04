@@ -175,8 +175,22 @@ async def on_message(message):
                 event_text = f"💥 **【奪寶奇兵：踩到地雷！】** {message.author.mention} 踩到臭地雷！隊伍悲慘 **-20 分**！"
                 LAST_EVENT_TIME = current_time  # 更新事件時間，進入冷卻
 
-        # 寫入數據
-        game_data["teams"][team] += (base_team_change + event_team_change)
+        # 🟢 新增：動態劣勢補償機制
+        red_score = game_data["teams"]["red"]
+        blue_score = game_data["teams"]["blue"]
+        
+        multiplier = 1.0
+        # 如果紅隊領先藍隊超過 500 分，藍隊獲得 1.5 倍積分
+        if team == "blue" and (red_score - blue_score) > 500:
+            multiplier = 1.5
+        # 如果藍隊領先紅隊超過 500 分，紅隊獲得 1.5 倍積分
+        elif team == "red" and (blue_score - red_score) > 500:
+            multiplier = 1.5
+        
+        # 寫入數據時套用乘數 (四捨五入)
+        actual_team_change = round((base_team_change + event_team_change) * multiplier)
+        
+        game_data["teams"][team] += actual_team_change
         game_data["users"][user_id]["points"] += (base_points_gained + event_points_gained)
         game_data["users"][user_id]["total_msg"] += 1
         game_data["users"][user_id]["daily_msg"] += 1
@@ -376,22 +390,30 @@ async def process_purchase(interaction, cost, item_name, is_battle_item=False):
     if not my_team:
         await interaction.response.send_message("❌ 你還沒有加入任何陣營，無法購買！", ephemeral=True)
         return False, None
+    
+    # 🟢 新增：落後隊伍打 8 折優惠
+    red_score = game_data["teams"]["red"]
+    blue_score = game_data["teams"]["blue"]
+    
+    discounted_cost = cost
+    if (my_team == "blue" and red_score > blue_score) or (my_team == "red" and blue_score > red_score):
+        discounted_cost = int(cost * 0.8) # 打八折
 
-    # 檢查點數
+    # 檢查點數 (使用折扣後的價格)
     user_points = game_data["users"].get(user_id, {}).get("points", 0)
-    if user_points < cost:
-        await interaction.response.send_message(f"❌ 你的積分不夠！購買【{item_name}】需要 `{cost}` 積分，你目前只有 `{user_points}` 點。", ephemeral=True)
+    if user_points < discounted_cost:
+        await interaction.response.send_message(f"❌ 你的積分不夠！購買【{item_name}】需要 `{discounted_cost}` 積分{' (已打8折)' if discounted_cost != cost else ''}，你目前只有 `{user_points}` 點。", ephemeral=True)
         return False, None
 
-    # 扣點
-    game_data["users"][user_id]["points"] -= cost
+    # 扣點 (改用折扣價)
+    game_data["users"][user_id]["points"] -= discounted_cost
     save_data()
 
     # 抓取主要聊天室
     record_channel = interaction.guild.get_channel(RECORD_CHANNEL_ID)
     my_team_name = "🔴 紅隊" if my_team == "red" else "🔵 藍隊"
     
-    return True, (record_channel, my_team, my_team_name)
+    return True, (record_channel, my_team, my_team_name, discounted_cost)
 
 
 # 戰術類別道具按鈕執行
@@ -402,19 +424,21 @@ class WelfareItemsView(View):
     async def buy_broadcast(self, interaction: discord.Interaction, button: Button):
         success, info = await process_purchase(interaction, 100, "全服大聲公")
         if success:
-            record_channel, _, team_name = info
+            record_channel, _, team_name, discounted_cost = info
+            discount_note = " (已打8折)" if discounted_cost != 100 else ""
             await interaction.response.send_message("✅ 購買成功！請等待管理員與你聯繫發表大聲公！", ephemeral=True)
             if record_channel:
-                await record_channel.send(f"🛍️ **【黑市購物紀錄】** {team_name} 的 {interaction.user.mention} 剛剛花費了 **100 積分** 購買了 📣 **【全服大聲公】**！請管理員協助發放福利！")
+                await record_channel.send(f"🛍️ **【黑市購物紀錄】** {team_name} 的 {interaction.user.mention} 剛剛花費了 **{discounted_cost} 積分{discount_note} 購買了 📣 **【全服大聲公】**！請管理員協助發放福利！")
 
     @discord.ui.button(label="📊 購買全民大投票 (150分)", style=discord.ButtonStyle.primary)
     async def buy_vote(self, interaction: discord.Interaction, button: Button):
         success, info = await process_purchase(interaction, 150, "全民大投票")
         if success:
-            record_channel, _, team_name = info
+            record_channel, _, team_name, discounted_cost = info
+            discount_note = " (已打8折)" if discounted_cost != 150 else ""
             await interaction.response.send_message("✅ 購買成功！請把你想問大家的問題整理好，等待管理員去投票頻道幫你出題！", ephemeral=True)
             if record_channel:
-                await record_channel.send(f"🛍️ **【黑市購物紀錄】** {team_name} 的 {interaction.user.mention} 剛剛花費了 **150 積分** 購買了 📊 **【全民大投票】**！請管理員去投票頻道幫忙出題！")
+                await record_channel.send(f"🛍️ **【黑市購物紀錄】** {team_name} 的 {interaction.user.mention} 剛剛花費了 **{discounted_cost} 積分{discount_note} 購買了 📊 **【全民大投票】**！請管理員去投票頻道幫忙出題！")
 
 
 # 戰術對抗類別道具按鈕執行 (維持自動化扣大比分)
