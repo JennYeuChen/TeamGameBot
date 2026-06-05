@@ -52,6 +52,16 @@ else:
 # 🟢 加在這裡
 LAST_EVENT_TIME = datetime.datetime.min
 
+# --- 🛒 商店價格設定區 (隨時可以調整) ---
+SHOP_PRICES = {
+    "精準打擊": 15,    # 原 20 -> 降至 15
+    "幸運翻倍卡": 40,  # 原 60 -> 降至 40
+    "陣營核彈": 150,   # 原 200 -> 降至 150
+    "積分竊盜術": 80,  # 原 120 -> 降至 80
+    "全服大聲公": 80,  # 原 100 -> 降至 80
+    "全民大投票": 100  # 原 150 -> 降至 100
+}
+
 # 📊 Google Sheets 連線設定
 from google.oauth2.service_account import Credentials
 import gspread
@@ -100,7 +110,8 @@ def sync_to_sheets():
                 str(uid),
                 udata.get("points", 0),
                 udata.get("total_msg", 0),
-                udata.get("daily_msg", 0)
+                udata.get("daily_msg", 0),
+                udata.get("last_checkin", "")
             ])
         
         # 不要刪除，直接從第 2 行開始覆蓋寫入
@@ -113,92 +124,70 @@ def sync_to_sheets():
     except Exception as e:
         print(f"📊 【雲端同步錯誤】: {e}")
 
-# --- 1. 每日午夜重設任務 ---
-@tasks.loop(time=datetime.time(hour=0, minute=0))
+# --- 1. 每日午夜重設任務 (台灣時間 UTC+8，即 UTC 16:00) ---
+@tasks.loop(time=datetime.time(hour=16, minute=0))
 async def reset_daily_stats():
     for user_id in game_data["users"]:
         game_data["users"][user_id]["daily_msg"] = 0
     save_data()
+    # 確保雲端數據也同步重置
+    if SHEET_CONNECTED:
+        threading.Thread(target=sync_to_sheets, daemon=True).start()
     print("【系統】每日午夜已重設所有人本日發言量。")
 
-# --- 2. 監聽發言：自動平衡計分 + 個人積分 + 奪寶奇兵暴擊/地雷 ---
+# --- 2. 監聽發言：自動平衡計分 + 個人積分 + 落後隊伍專屬寶藏 ---
 @bot.event
 async def on_message(message):
-    global LAST_EVENT_TIME  # 🟢 1. 宣告全域變數
+    global LAST_EVENT_TIME
 
-    # 🛡️ 2. 鋼鐵防線：只要發言者是機器人，或是系統 webhook，一律絕對跳過！
     if message.author.bot or message.webhook_id is not None or message.guild is None:
         return
 
     user_id = str(message.author.id)
+    # 初始化資料
+    if user_id not in game_data["users"]:
+        game_data["users"][user_id] = {"points": 0, "total_msg": 0, "daily_msg": 0, "last_checkin": ""}
+
+    # 簽到系統
+    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    if "早安" in message.content and game_data["users"][user_id].get("last_checkin") != today_str:
+        game_data["users"][user_id]["points"] += 10
+        game_data["users"][user_id]["last_checkin"] = today_str
+        save_data()
+        await message.channel.send(f"☀️ {message.author.mention} 簽到成功！獲得 **+10 積分**！")
+
     user_role_ids = [role.id for role in message.author.roles]
+    team = "red" if RED_TEAM_ROLE_ID in user_role_ids else "blue" if BLUE_TEAM_ROLE_ID in user_role_ids else None
 
-    # 判斷使用者屬於哪一隊
-    team = None
-    if RED_TEAM_ROLE_ID in user_role_ids:
-        team = "red"
-    elif BLUE_TEAM_ROLE_ID in user_role_ids:
-        team = "blue"
-
-    # 如果有歸屬陣營，才開始計算發言
     if team:
-        # 初始化個人數據
-        if user_id not in game_data["users"]:
-            game_data["users"][user_id] = {
-                "points": 0,       # 個人可用積分（用來去商店買東西）
-                "total_msg": 0,    # 個人總發言數
-                "daily_msg": 0     # 個人本日發言數
-            }
+        # 判斷是否為落後隊伍
+        red_score = game_data["teams"]["red"]
+        blue_score = game_data["teams"]["blue"]
+        is_losing = (team == "red" and red_score < blue_score) or (team == "blue" and blue_score < red_score)
         
-        # 🟢 先把這次發言應得的「基本分」和「突發事件文字」準備好，但先不寫入！
-        base_team_change = 1
-        base_points_gained = 1
-        
-        event_team_change = 0
         event_points_gained = 0
         event_text = ""
 
-# 🎰 奪寶奇兵機制：隨機突發事件 (1% 暴擊 / 0.5% 地雷)
+        # 🎰 寶藏機制：僅落後隊伍有 1% 機率觸發暴擊
         dice = random.random()
         current_time = datetime.datetime.now()
         
-        # 🛡️ 檢查冷卻時間：如果距離上次事件還沒超過 15 秒，直接當作沒事發生
-        if (current_time - LAST_EVENT_TIME).total_seconds() >= 15:
-            if dice < 0.01:  # 1% 機率觸發幸運暴擊
-                event_team_change = 50
+        if is_losing and (current_time - LAST_EVENT_TIME).total_seconds() >= 15:
+            if dice < 0.01:  # 1% 觸發
                 event_points_gained = 50
-                event_text = f"🔥 **【奪寶奇兵：幸運暴擊！】** {message.author.mention} 挖到大寶藏！幫隊伍與個人大賺 **+50 分**！"
-                LAST_EVENT_TIME = current_time  # 更新事件時間，進入冷卻
-            elif dice < 0.015: # 0.5% 機率踩到地雷
-                event_team_change = -20
-                event_points_gained = 0  
-                event_text = f"💥 **【奪寶奇兵：踩到地雷！】** {message.author.mention} 踩到臭地雷！隊伍悲慘 **-20 分**！"
-                LAST_EVENT_TIME = current_time  # 更新事件時間，進入冷卻
+                event_text = f"🔥 **【落後方獎勵：發現大寶藏！】** {message.author.mention} 挖到寶藏！隊伍與個人大賺 **+50 分**！"
+                LAST_EVENT_TIME = current_time
+                game_data["teams"][team] += 50
 
-        # 🟢 新增：動態劣勢補償機制
-        red_score = game_data["teams"]["red"]
-        blue_score = game_data["teams"]["blue"]
-        
-        multiplier = 1.0
-        # 如果紅隊領先藍隊超過 500 分，藍隊獲得 1.5 倍積分
-        if team == "blue" and (red_score - blue_score) > 500:
-            multiplier = 1.5
-        # 如果藍隊領先紅隊超過 500 分，紅隊獲得 1.5 倍積分
-        elif team == "red" and (blue_score - red_score) > 500:
-            multiplier = 1.5
-        
-        # 寫入數據時套用乘數 (四捨五入)
-        actual_team_change = round((base_team_change + event_team_change) * multiplier)
-        
-        game_data["teams"][team] += actual_team_change
-        game_data["users"][user_id]["points"] += (base_points_gained + event_points_gained)
+        # 基本加分
+        game_data["teams"][team] += 1
+        game_data["users"][user_id]["points"] += (1 + event_points_gained)
         game_data["users"][user_id]["total_msg"] += 1
         game_data["users"][user_id]["daily_msg"] += 1
         save_data()
 
-        # 如果有觸發突發事件，發送通知
         if event_text:
-            embed = discord.Embed(description=event_text, color=discord.Color.gold() if event_team_change > 0 else discord.Color.red())
+            embed = discord.Embed(description=event_text, color=discord.Color.gold())
             await message.channel.send(embed=embed)
 
     await bot.process_commands(message)
@@ -229,7 +218,12 @@ class AirdropView(View):
         
         # 初始化數據安全檢查
         if user_id not in game_data["users"]:
-            game_data["users"][user_id] = {"points": 0, "total_msg": 0, "daily_msg": 0}
+            game_data["users"][user_id] = {
+                "points": 0, 
+                "total_msg": 0, 
+                "daily_msg": 0, 
+                "last_checkin": ""
+            }
 
         game_data["teams"][team] += 10
         game_data["users"][user_id]["points"] += 10
@@ -318,14 +312,19 @@ async def status(ctx):
     user_id = str(ctx.author.id)
     
     # 讀取個人數據
-    p_stats = game_data["users"].get(user_id, {"points": 0, "total_msg": 0, "daily_msg": 0})
+    p_stats = game_data["users"].get(user_id, {"points": 0, "total_msg": 0, "daily_msg": 0, "last_checkin": ""})
+    
+    # 檢查今日是否已簽到
+    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    has_checked_in = p_stats.get("last_checkin") == today_str
+    checkin_status = "✅ 已簽到" if has_checked_in else "❌ 未簽到 (說「早安」領取 10 積分！)"
     
     embed = discord.Embed(title="📊 陣營戰況與個人資產", color=discord.Color.green())
     
     # 個人資產面板
     embed.add_field(
         name=f"👤 {ctx.author.display_name} 的錢包",
-        value=f"🪙 個人積分 (金幣)：**{p_stats['points']}**\n💬 今日發言：`{p_stats['daily_msg']}` 則\n📊 累計發言：`{p_stats['total_msg']}` 則",
+        value=f"🪙 個人積分 (金幣)：**{p_stats['points']}**\n💬 今日發言：`{p_stats['daily_msg']}` 則\n📊 累計發言：`{p_stats['total_msg']}` 則\n☀️ 今日簽到：{checkin_status}",
         inline=False
     )
     # 陣營總分面板
@@ -363,18 +362,18 @@ class ShopCategoryView(View):
     @discord.ui.button(label="⚔️ 戰術比賽類商品", style=discord.ButtonStyle.danger, custom_id="shop_battle")
     async def battle_shop(self, interaction: discord.Interaction, button: Button):
         embed = discord.Embed(title="⚔️ 戰術比賽商店 (自動扣敵方分數)", color=discord.Color.red())
-        embed.add_field(name="💥 1. 精準打擊 — 價格 20 積分", value="效果：直接扣除敵方陣營 **10 分**。", inline=False)
-        embed.add_field(name="🎰 2. 幸運翻倍卡 — 價格 60 積分", value="效果：接下來 5 句話有 50% 機率獲得 5 倍積分。\n*(購買後需等管理員稍後人工開啟或排進紀錄)*", inline=False)
-        embed.add_field(name="☢️ 3. 陣營核彈 — 價格 200 積分", value="效果：直接摧毀敵方陣營 **120 分**！", inline=False)
-        embed.add_field(name="🪓 4. 積分竊盜術 — 價格 120 積分", value="效果：隨機偷取敵方一名在線成員 80~150 個人積分。", inline=False)
+        embed.add_field(name=f"💥 1. 精準打擊 — 價格 {SHOP_PRICES['精準打擊']} 積分", value="效果：直接扣除敵方陣營 **10 分**。", inline=False)
+        embed.add_field(name=f"🎰 2. 幸運翻倍卡 — 價格 {SHOP_PRICES['幸運翻倍卡']} 積分", value="效果：接下來 5 句話有 50% 機率獲得 5 倍積分。\n*(購買後需等管理員稍後人工開啟或排進紀錄)*", inline=False)
+        embed.add_field(name=f"☢️ 3. 陣營核彈 — 價格 {SHOP_PRICES['陣營核彈']} 積分", value="效果：直接摧毀敵方陣營 **120 分**！", inline=False)
+        embed.add_field(name=f"🪓 4. 積分竊盜術 — 價格 {SHOP_PRICES['積分竊盜術']} 積分", value="效果：隨機偷取敵方一名在線成員 80~150 個人積分。", inline=False)
         
         await interaction.response.edit_message(embed=embed, view=BattleItemsView())
 
     @discord.ui.button(label="🎁 社群福利類商品", style=discord.ButtonStyle.success, custom_id="shop_welfare")
     async def welfare_shop(self, interaction: discord.Interaction, button: Button):
         embed = discord.Embed(title="🎁 社群福利商店 (管理員人工發放)", color=discord.Color.green())
-        embed.add_field(name="📣 1. 全服大聲公 — 價格 100 積分", value="效果：由管理員幫你在公告頻道發表一句宣言並 Tag 全員！", inline=False)
-        embed.add_field(name="📊 2. 全民大投票 — 價格 150 積分", value="效果：獲得一次出題權，管理員會在投票頻道幫你發起一個話題投票！", inline=False)
+        embed.add_field(name=f"📣 1. 全服大聲公 — 價格 {SHOP_PRICES['全服大聲公']} 積分", value="效果：由管理員幫你在公告頻道發表一句宣言並 Tag 全員！", inline=False)
+        embed.add_field(name=f"📊 2. 全民大投票 — 價格 {SHOP_PRICES['全民大投票']} 積分", value="效果：獲得一次出題權，管理員會在投票頻道幫你發起一個話題投票！", inline=False)
         embed.set_footer(text="提示：按下購買後，紀錄會送至主要聊天室，管理員看到後會為您服務。")
         
         await interaction.response.edit_message(embed=embed, view=WelfareItemsView())
@@ -420,22 +419,22 @@ async def process_purchase(interaction, cost, item_name, is_battle_item=False):
 class WelfareItemsView(View):
     def __init__(self): super().__init__(timeout=60)
 
-    @discord.ui.button(label="📣 購買大聲公 (100分)", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label=f"📣 購買大聲公 ({SHOP_PRICES['全服大聲公']}分)", style=discord.ButtonStyle.primary)
     async def buy_broadcast(self, interaction: discord.Interaction, button: Button):
-        success, info = await process_purchase(interaction, 100, "全服大聲公")
+        success, info = await process_purchase(interaction, SHOP_PRICES["全服大聲公"], "全服大聲公")
         if success:
             record_channel, _, team_name, discounted_cost = info
-            discount_note = " (已打8折)" if discounted_cost != 100 else ""
+            discount_note = " (已打8折)" if discounted_cost != SHOP_PRICES["全服大聲公"] else ""
             await interaction.response.send_message("✅ 購買成功！請等待管理員與你聯繫發表大聲公！", ephemeral=True)
             if record_channel:
                 await record_channel.send(f"🛍️ **【黑市購物紀錄】** {team_name} 的 {interaction.user.mention} 剛剛花費了 **{discounted_cost} 積分{discount_note} 購買了 📣 **【全服大聲公】**！請管理員協助發放福利！")
 
-    @discord.ui.button(label="📊 購買全民大投票 (150分)", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label=f"📊 購買全民大投票 ({SHOP_PRICES['全民大投票']}分)", style=discord.ButtonStyle.primary)
     async def buy_vote(self, interaction: discord.Interaction, button: Button):
-        success, info = await process_purchase(interaction, 150, "全民大投票")
+        success, info = await process_purchase(interaction, SHOP_PRICES["全民大投票"], "全民大投票")
         if success:
             record_channel, _, team_name, discounted_cost = info
-            discount_note = " (已打8折)" if discounted_cost != 150 else ""
+            discount_note = " (已打8折)" if discounted_cost != SHOP_PRICES["全民大投票"] else ""
             await interaction.response.send_message("✅ 購買成功！請把你想問大家的問題整理好，等待管理員去投票頻道幫你出題！", ephemeral=True)
             if record_channel:
                 await record_channel.send(f"🛍️ **【黑市購物紀錄】** {team_name} 的 {interaction.user.mention} 剛剛花費了 **{discounted_cost} 積分{discount_note} 購買了 📊 **【全民大投票】**！請管理員去投票頻道幫忙出題！")
@@ -445,11 +444,12 @@ class WelfareItemsView(View):
 class BattleItemsView(View):
     def __init__(self): super().__init__(timeout=60)
 
-    @discord.ui.button(label="💥 精準打擊 (20分)", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label=f"💥 精準打擊 ({SHOP_PRICES['精準打擊']}分)", style=discord.ButtonStyle.secondary)
     async def buy_smash(self, interaction: discord.Interaction, button: Button):
-        success, info = await process_purchase(interaction, 20, "精準打擊")
+        success, info = await process_purchase(interaction, SHOP_PRICES["精準打擊"], "精準打擊")
         if success:
-            record_channel, my_team, team_name = info
+            record_channel, my_team, team_name, discounted_cost = info
+            discount_note = " (已打8折)" if discounted_cost != SHOP_PRICES["精準打擊"] else ""
             enemy_team = "blue" if my_team == "red" else "red"
             enemy_name = "🔵 藍隊" if enemy_team == "blue" else "🔴 紅隊"
             
@@ -458,22 +458,24 @@ class BattleItemsView(View):
             
             await interaction.response.send_message(f"💥 成功發動打擊！敵方分數 -10！", ephemeral=True)
             if record_channel:
-                await record_channel.send(f"💥 **【戰術打擊紀錄】** {team_name} 的 {interaction.user.mention} 購買了 **【精準打擊】**，{enemy_name} 的團隊分數被強行扣除 **-10** 分！")
+                await record_channel.send(f"💥 **【戰術打擊紀錄】** {team_name} 的 {interaction.user.mention} 花費了 **{discounted_cost} 積分{discount_note} 購買了 **【精準打擊】**，{enemy_name} 的團隊分數被強行扣除 **-10** 分！")
 
-    @discord.ui.button(label="🎰 幸運翻倍卡 (60分)", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label=f"🎰 幸運翻倍卡 ({SHOP_PRICES['幸運翻倍卡']}分)", style=discord.ButtonStyle.secondary)
     async def buy_lucky(self, interaction: discord.Interaction, button: Button):
-        success, info = await process_purchase(interaction, 60, "幸運翻倍卡")
+        success, info = await process_purchase(interaction, SHOP_PRICES["幸運翻倍卡"], "幸運翻倍卡")
         if success:
-            record_channel, _, team_name = info
+            record_channel, _, team_name, discounted_cost = info
+            discount_note = " (已打8折)" if discounted_cost != SHOP_PRICES["幸運翻倍卡"] else ""
             await interaction.response.send_message("✅ 購買成功！", ephemeral=True)
             if record_channel:
-                await record_channel.send(f"🛍️ **【黑市購物紀錄】** {team_name} 的 {interaction.user.mention} 購買了 🎰 **【幸運翻倍卡】**！")
+                await record_channel.send(f"🛍️ **【黑市購物紀錄】** {team_name} 的 {interaction.user.mention} 花費了 **{discounted_cost} 積分{discount_note} 購買了 🎰 **【幸運翻倍卡】**！")
 
-    @discord.ui.button(label="☢️ 陣營核彈 (200分)", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label=f"☢️ 陣營核彈 ({SHOP_PRICES['陣營核彈']}分)", style=discord.ButtonStyle.secondary)
     async def buy_nuke(self, interaction: discord.Interaction, button: Button):
-        success, info = await process_purchase(interaction, 200, "陣營核彈")
+        success, info = await process_purchase(interaction, SHOP_PRICES["陣營核彈"], "陣營核彈")
         if success:
-            record_channel, my_team, team_name = info
+            record_channel, my_team, team_name, discounted_cost = info
+            discount_note = " (已打8折)" if discounted_cost != SHOP_PRICES["陣營核彈"] else ""
             enemy_team = "blue" if my_team == "red" else "red"
             enemy_name = "🔵 藍隊" if enemy_team == "blue" else "🔴 紅隊"
             
@@ -482,13 +484,14 @@ class BattleItemsView(View):
             
             await interaction.response.send_message(f"☢️ 核彈爆炸！敵方分數 -120！", ephemeral=True)
             if record_channel:
-                await record_channel.send(f"☢️ **【毀滅打擊紀錄】** {team_name} 的 {interaction.user.mention} 引爆了 **【陣營核彈】**！{enemy_name} 哀鴻遍野，總分數暴跌 **-120** 分！")
+                await record_channel.send(f"☢️ **【毀滅打擊紀錄】** {team_name} 的 {interaction.user.mention} 花費了 **{discounted_cost} 積分{discount_note} 引爆了 **【陣營核彈】**！{enemy_name} 哀鴻遍野，總分數暴跌 **-120** 分！")
 
-    @discord.ui.button(label="🪓 積分竊盜術 (120分)", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label=f"🪓 積分竊盜術 ({SHOP_PRICES['積分竊盜術']}分)", style=discord.ButtonStyle.secondary)
     async def buy_steal(self, interaction: discord.Interaction, button: Button):
-        success, info = await process_purchase(interaction, 120, "積分竊盜術")
+        success, info = await process_purchase(interaction, SHOP_PRICES["積分竊盜術"], "積分竊盜術")
         if success:
-            record_channel, my_team, team_name = info
+            record_channel, my_team, team_name, discounted_cost = info
+            discount_note = " (已打8折)" if discounted_cost != SHOP_PRICES["積分竊盜術"] else ""
             enemy_team = "blue" if my_team == "red" else "red"
             
             # 🟢 修正：精準抓出「目前真正待在敵方身分組」且身上有錢的受害者
@@ -504,7 +507,7 @@ class BattleItemsView(View):
             if not enemy_users:
                 # 退錢
                 user_id = str(interaction.user.id)
-                game_data["users"][user_id]["points"] += 120
+                game_data["users"][user_id]["points"] += discounted_cost
                 save_data()
                 await interaction.response.send_message("❌ 敵方陣營所有人都是窮光蛋，沒錢可偷！積分已退還。", ephemeral=True)
                 return
@@ -525,7 +528,7 @@ class BattleItemsView(View):
             if record_channel:
                 victim_user = interaction.guild.get_member(int(victim_id))
                 victim_name = victim_user.mention if victim_user else f"ID: {victim_id}"
-                await record_channel.send(f"🪓 **【黑市小偷紀錄】** {team_name} 的 {interaction.user.mention} 發動 **【積分竊盜術】**！把敵方成員 {victim_name} 口袋裡的 **{actual_stolen} 積分** 直接摸走了！")
+                await record_channel.send(f"🪓 **【黑市小偷紀錄】** {team_name} 的 {interaction.user.mention} 花費了 **{discounted_cost} 積分{discount_note} 發動 **【積分竊盜術】**！把敵方成員 {victim_name} 口袋裡的 **{actual_stolen} 積分** 直接摸走了！")
 
 
 # --- 7. 機器人上線通知 ---
@@ -543,6 +546,26 @@ async def on_ready():
             # 確保正確解析 (處理 "紅隊總分: 2345" 的格式)
             game_data['teams']['red'] = int(red_str.split(': ')[1])
             game_data['teams']['blue'] = int(blue_str.split(': ')[1])
+            
+            # 讀取 Sheet 上的用戶數據
+            try:
+                records = sheet.get_all_records()
+                if records:
+                    game_data['users'] = {}
+                    for record in records:
+                        # 確保數據有所有必要字段
+                        user_id = str(record.get('user_id', ''))
+                        if user_id:
+                            game_data['users'][user_id] = {
+                                'points': record.get('points', 0),
+                                'total_msg': record.get('total_msg', 0),
+                                'daily_msg': record.get('daily_msg', 0),
+                                'last_checkin': record.get('last_checkin', '')
+                            }
+                    print(f"【系統】已強制從雲端同步 {len(game_data['users'])} 筆用戶數據！")
+            except Exception as e:
+                print(f"【用戶數據同步失敗】: {e}")
+                
             print("【系統】已強制從雲端同步分數回記憶體！")
         except Exception as e:
             print(f"【同步失敗】: {e}")
