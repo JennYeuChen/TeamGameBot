@@ -148,16 +148,23 @@ async def on_message(message):
     if user_id not in game_data["users"]:
         game_data["users"][user_id] = {"points": 0, "total_msg": 0, "daily_msg": 0, "last_checkin": ""}
 
-    # 簽到系統
-    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    if "早安" in message.content and game_data["users"][user_id].get("last_checkin") != today_str:
-        game_data["users"][user_id]["points"] += 10
-        game_data["users"][user_id]["last_checkin"] = today_str
-        save_data()
-        await message.channel.send(f"☀️ {message.author.mention} 簽到成功！獲得 **+10 積分**！")
-
     user_role_ids = [role.id for role in message.author.roles]
     team = "red" if RED_TEAM_ROLE_ID in user_role_ids else "blue" if BLUE_TEAM_ROLE_ID in user_role_ids else None
+
+    # --- 🟢 修改後的簽到系統：個人與團隊同時加分 ---
+    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    if "早安" in message.content and game_data["users"][user_id].get("last_checkin") != today_str:
+        # 1. 更新個人資料
+        game_data["users"][user_id]["points"] += 10
+        game_data["users"][user_id]["last_checkin"] = today_str
+        
+        # 2. 同步增加隊伍分數 (需先確認 user 有隊伍)
+        if team:
+            game_data["teams"][team] += 10
+            
+        save_data() # 存檔並自動同步到 Google Sheets
+        await message.channel.send(f"☀️ {message.author.mention} 簽到成功！為 {('🔴 紅隊' if team == 'red' else '🔵 藍隊')} 貢獻了 10 分，自己也獲得 **+10 積分**！")
+    # -------------------------------------------
 
     if team:
         # 判斷是否為落後隊伍
