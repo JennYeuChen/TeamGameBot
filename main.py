@@ -7,7 +7,11 @@ import random
 import datetime
 import threading
 import time
+from asyncio import Lock
 from flask import Flask
+
+# 用戶鎖定字典，防止並發刷分
+user_locks = {}
 
 app = Flask('')
 
@@ -153,33 +157,39 @@ async def on_message(message):
     user_role_ids = [role.id for role in message.author.roles]
     team = "red" if RED_TEAM_ROLE_ID in user_role_ids else "blue" if BLUE_TEAM_ROLE_ID in user_role_ids else None
 
-    # --- 🟢 修改後的簽到系統：加入冷卻時間 ---
-    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    # 紀錄該用戶上次簽到的時間戳記 (time.time())
-    current_time = time.time()
-    last_time = game_data["users"][user_id].get("last_checkin_timestamp", 0)
-
+    # --- 🟢 修改後的嚴謹簽到系統 ---
     if "早安" in message.content:
-        # 1. 檢查是否已經簽到過 (日期判斷)
-        if game_data["users"][user_id].get("last_checkin") == today_str:
-            # 已經簽到過，不重複處理
-            pass
-        # 2. 檢查冷卻時間 (3秒)
-        elif (current_time - last_time) < 3:
-            # 沒到 3 秒，忽略這次觸發
-            pass
-        else:
-            # 3. 正式簽到邏輯
-            game_data["users"][user_id]["points"] += 10
-            game_data["users"][user_id]["last_checkin"] = today_str
-            game_data["users"][user_id]["last_checkin_timestamp"] = current_time  # 更新時間戳記
+        # 確保該用戶有鎖
+        if user_id not in user_locks:
+            user_locks[user_id] = Lock()
+        
+        async with user_locks[user_id]:
+            # 取得使用者資料引用，減少重複查字典的開銷
+            u_data = game_data["users"][user_id]
+            today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+            current_time = time.time()
             
-            if team:
-                game_data["teams"][team] += 10
-            
-            save_data()  # 存檔並自動同步到 Google Sheets
-            await message.channel.send(f"☀️ {message.author.mention} 簽到成功！為 {('🔴 紅隊' if team == 'red' else '🔵 藍隊')} 貢獻了 10 分，自己也獲得 **+10 積分**！")
-    # -------------------------------------------
+            # 1. 檢查日期鎖 (這保證了一天一次)
+            if u_data.get("last_checkin") == today_str:
+                # 已經簽到過，不作處理
+                pass
+            # 2. 檢查 3 秒冷卻鎖 (防止連續發送刷分)
+            elif (current_time - u_data.get("last_checkin_timestamp", 0)) < 3:
+                # 這裡可以靜默忽略，也可以給予警告
+                # await message.add_reaction("⏳") # 選擇性：給個反應提示冷卻中
+                pass
+            else:
+                # 3. 執行簽到：先鎖定再更新
+                u_data["last_checkin"] = today_str
+                u_data["last_checkin_timestamp"] = current_time
+                
+                u_data["points"] += 10
+                if team:
+                    game_data["teams"][team] += 10
+                
+                save_data()  # 存檔
+                await message.channel.send(f"☀️ {message.author.mention} 簽到成功！為 {('🔴 紅隊' if team == 'red' else '🔵 藍隊')} 貢獻了 10 分，自己也獲得 **+10 積分**！")
+    # ---------------------------
 
     if team:
         # 判斷是否為落後隊伍
