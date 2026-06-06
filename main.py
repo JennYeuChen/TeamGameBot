@@ -6,6 +6,7 @@ import os
 import random
 import datetime
 import threading
+import time
 from flask import Flask
 
 app = Flask('')
@@ -111,7 +112,8 @@ def sync_to_sheets():
                 udata.get("points", 0),
                 udata.get("total_msg", 0),
                 udata.get("daily_msg", 0),
-                udata.get("last_checkin", "")
+                udata.get("last_checkin", ""),
+                udata.get("last_checkin_timestamp", 0)
             ])
         
         # 不要刪除，直接從第 2 行開始覆蓋寫入
@@ -146,24 +148,37 @@ async def on_message(message):
     user_id = str(message.author.id)
     # 初始化資料
     if user_id not in game_data["users"]:
-        game_data["users"][user_id] = {"points": 0, "total_msg": 0, "daily_msg": 0, "last_checkin": ""}
+        game_data["users"][user_id] = {"points": 0, "total_msg": 0, "daily_msg": 0, "last_checkin": "", "last_checkin_timestamp": 0}
 
     user_role_ids = [role.id for role in message.author.roles]
     team = "red" if RED_TEAM_ROLE_ID in user_role_ids else "blue" if BLUE_TEAM_ROLE_ID in user_role_ids else None
 
-    # --- 🟢 修改後的簽到系統：個人與團隊同時加分 ---
+    # --- 🟢 修改後的簽到系統：加入冷卻時間 ---
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    if "早安" in message.content and game_data["users"][user_id].get("last_checkin") != today_str:
-        # 1. 更新個人資料
-        game_data["users"][user_id]["points"] += 10
-        game_data["users"][user_id]["last_checkin"] = today_str
-        
-        # 2. 同步增加隊伍分數 (需先確認 user 有隊伍)
-        if team:
-            game_data["teams"][team] += 10
+    # 紀錄該用戶上次簽到的時間戳記 (time.time())
+    current_time = time.time()
+    last_time = game_data["users"][user_id].get("last_checkin_timestamp", 0)
+
+    if "早安" in message.content:
+        # 1. 檢查是否已經簽到過 (日期判斷)
+        if game_data["users"][user_id].get("last_checkin") == today_str:
+            # 已經簽到過，不重複處理
+            pass
+        # 2. 檢查冷卻時間 (3秒)
+        elif (current_time - last_time) < 3:
+            # 沒到 3 秒，忽略這次觸發
+            pass
+        else:
+            # 3. 正式簽到邏輯
+            game_data["users"][user_id]["points"] += 10
+            game_data["users"][user_id]["last_checkin"] = today_str
+            game_data["users"][user_id]["last_checkin_timestamp"] = current_time  # 更新時間戳記
             
-        save_data() # 存檔並自動同步到 Google Sheets
-        await message.channel.send(f"☀️ {message.author.mention} 簽到成功！為 {('🔴 紅隊' if team == 'red' else '🔵 藍隊')} 貢獻了 10 分，自己也獲得 **+10 積分**！")
+            if team:
+                game_data["teams"][team] += 10
+            
+            save_data()  # 存檔並自動同步到 Google Sheets
+            await message.channel.send(f"☀️ {message.author.mention} 簽到成功！為 {('🔴 紅隊' if team == 'red' else '🔵 藍隊')} 貢獻了 10 分，自己也獲得 **+10 積分**！")
     # -------------------------------------------
 
     if team:
@@ -229,7 +244,8 @@ class AirdropView(View):
                 "points": 0, 
                 "total_msg": 0, 
                 "daily_msg": 0, 
-                "last_checkin": ""
+                "last_checkin": "",
+                "last_checkin_timestamp": 0
             }
 
         game_data["teams"][team] += 10
@@ -567,7 +583,8 @@ async def on_ready():
                                 'points': record.get('points', 0),
                                 'total_msg': record.get('total_msg', 0),
                                 'daily_msg': record.get('daily_msg', 0),
-                                'last_checkin': record.get('last_checkin', '')
+                                'last_checkin': record.get('last_checkin', ''),
+                                'last_checkin_timestamp': record.get('last_checkin_timestamp', 0)
                             }
                     print(f"【系統】已強制從雲端同步 {len(game_data['users'])} 筆用戶數據！")
             except Exception as e:
