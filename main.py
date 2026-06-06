@@ -117,7 +117,8 @@ def sync_to_sheets():
                 udata.get("total_msg", 0),
                 udata.get("daily_msg", 0),
                 udata.get("last_checkin", ""),
-                udata.get("last_checkin_timestamp", 0)
+                udata.get("last_checkin_timestamp", 0),
+                udata.get("last_msg_timestamp", 0)
             ])
         
         # 不要刪除，直接從第 2 行開始覆蓋寫入
@@ -152,75 +153,78 @@ async def on_message(message):
     user_id = str(message.author.id)
     # 初始化資料
     if user_id not in game_data["users"]:
-        game_data["users"][user_id] = {"points": 0, "total_msg": 0, "daily_msg": 0, "last_checkin": "", "last_checkin_timestamp": 0}
+        game_data["users"][user_id] = {"points": 0, "total_msg": 0, "daily_msg": 0, "last_checkin": "", "last_checkin_timestamp": 0, "last_msg_timestamp": 0}
 
-    user_role_ids = [role.id for role in message.author.roles]
-    team = "red" if RED_TEAM_ROLE_ID in user_role_ids else "blue" if BLUE_TEAM_ROLE_ID in user_role_ids else None
-
-    # --- 🟢 修改後的嚴謹簽到系統 ---
-    if "早安" in message.content:
+    # 1. 處理簽到 (使用鎖定機制，嚴格判斷「早安」)
+    if "早安" == message.content.strip():  # 嚴格判斷，避免「早安大家」一直觸發
         # 確保該用戶有鎖
         if user_id not in user_locks:
             user_locks[user_id] = Lock()
         
         async with user_locks[user_id]:
-            # 取得使用者資料引用，減少重複查字典的開銷
             u_data = game_data["users"][user_id]
             today_str = datetime.datetime.now().strftime("%Y-%m-%d")
             current_time = time.time()
             
-            # 1. 檢查日期鎖 (這保證了一天一次)
-            if u_data.get("last_checkin") == today_str:
-                # 已經簽到過，不作處理
-                pass
-            # 2. 檢查 3 秒冷卻鎖 (防止連續發送刷分)
-            elif (current_time - u_data.get("last_checkin_timestamp", 0)) < 3:
-                # 這裡可以靜默忽略，也可以給予警告
-                # await message.add_reaction("⏳") # 選擇性：給個反應提示冷卻中
-                pass
-            else:
-                # 3. 執行簽到：先鎖定再更新
+            # 檢查日期鎖和冷卻鎖
+            if u_data.get("last_checkin") != today_str and (current_time - u_data.get("last_checkin_timestamp", 0)) >= 3:
+                # 執行簽到
                 u_data["last_checkin"] = today_str
                 u_data["last_checkin_timestamp"] = current_time
-                
                 u_data["points"] += 10
+                
+                # 確認隊伍並加分
+                user_role_ids = [role.id for role in message.author.roles]
+                team = "red" if RED_TEAM_ROLE_ID in user_role_ids else "blue" if BLUE_TEAM_ROLE_ID in user_role_ids else None
                 if team:
                     game_data["teams"][team] += 10
                 
-                save_data()  # 存檔
+                save_data()
                 await message.channel.send(f"☀️ {message.author.mention} 簽到成功！為 {('🔴 紅隊' if team == 'red' else '🔵 藍隊')} 貢獻了 10 分，自己也獲得 **+10 積分**！")
-    # ---------------------------
 
+    # 2. 正常發言邏輯 (這裡才是每一則訊息加分的地方)
+    user_role_ids = [role.id for role in message.author.roles]
+    team = "red" if RED_TEAM_ROLE_ID in user_role_ids else "blue" if BLUE_TEAM_ROLE_ID in user_role_ids else None
+    
     if team:
-        # 判斷是否為落後隊伍
-        red_score = game_data["teams"]["red"]
-        blue_score = game_data["teams"]["blue"]
-        is_losing = (team == "red" and red_score < blue_score) or (team == "blue" and blue_score < red_score)
+        u_data = game_data["users"][user_id]
+        current_time = time.time()
+        last_msg_time = u_data.get("last_msg_timestamp", 0)
         
-        event_points_gained = 0
-        event_text = ""
-
-        # 🎰 寶藏機制：僅落後隊伍有 1% 機率觸發暴擊
-        dice = random.random()
-        current_time = datetime.datetime.now()
-        
-        if is_losing and (current_time - LAST_EVENT_TIME).total_seconds() >= 15:
-            if dice < 0.01:  # 1% 觸發
-                event_points_gained = 50
-                event_text = f"🔥 **【落後方獎勵：發現大寶藏！】** {message.author.mention} 挖到寶藏！隊伍與個人大賺 **+50 分**！"
-                LAST_EVENT_TIME = current_time
-                game_data["teams"][team] += 50
-
-        # 基本加分
-        game_data["teams"][team] += 1
-        game_data["users"][user_id]["points"] += (1 + event_points_gained)
-        game_data["users"][user_id]["total_msg"] += 1
-        game_data["users"][user_id]["daily_msg"] += 1
-        save_data()
-
-        if event_text:
-            embed = discord.Embed(description=event_text, color=discord.Color.gold())
-            await message.channel.send(embed=embed)
+        # 【冷卻檢查】每一則發言加分前，檢查上次加分時間是否超過 3 秒
+        if (current_time - last_msg_time) > 3:
+            u_data["last_msg_timestamp"] = current_time
+            u_data["total_msg"] += 1
+            u_data["daily_msg"] += 1
+            
+            # 判斷是否為落後隊伍
+            red_score = game_data["teams"]["red"]
+            blue_score = game_data["teams"]["blue"]
+            is_losing = (team == "red" and red_score < blue_score) or (team == "blue" and blue_score < red_score)
+            
+            event_points_gained = 0
+            event_text = ""
+            
+            # 🎰 寶藏機制：僅落後隊伍有 1% 機率觸發暴擊
+            dice = random.random()
+            event_current_time = datetime.datetime.now()
+            
+            if is_losing and (event_current_time - LAST_EVENT_TIME).total_seconds() >= 15:
+                if dice < 0.01:  # 1% 觸發
+                    event_points_gained = 50
+                    event_text = f"🔥 **【落後方獎勵：發現大寶藏！】** {message.author.mention} 挖到寶藏！隊伍與個人大賺 **+50 分**！"
+                    LAST_EVENT_TIME = event_current_time
+                    game_data["teams"][team] += 50
+            
+            # 基本加分
+            game_data["teams"][team] += 1
+            u_data["points"] += (1 + event_points_gained)
+            
+            save_data()
+            
+            if event_text:
+                embed = discord.Embed(description=event_text, color=discord.Color.gold())
+                await message.channel.send(embed=embed)
 
     await bot.process_commands(message)
 
@@ -255,7 +259,8 @@ class AirdropView(View):
                 "total_msg": 0, 
                 "daily_msg": 0, 
                 "last_checkin": "",
-                "last_checkin_timestamp": 0
+                "last_checkin_timestamp": 0,
+                "last_msg_timestamp": 0
             }
 
         game_data["teams"][team] += 10
@@ -594,7 +599,8 @@ async def on_ready():
                                 'total_msg': record.get('total_msg', 0),
                                 'daily_msg': record.get('daily_msg', 0),
                                 'last_checkin': record.get('last_checkin', ''),
-                                'last_checkin_timestamp': record.get('last_checkin_timestamp', 0)
+                                'last_checkin_timestamp': record.get('last_checkin_timestamp', 0),
+                                'last_msg_timestamp': record.get('last_msg_timestamp', 0)
                             }
                     print(f"【系統】已強制從雲端同步 {len(game_data['users'])} 筆用戶數據！")
             except Exception as e:
