@@ -49,10 +49,13 @@ if os.path.exists(DATA_FILE):
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             game_data = json.load(f)
+            # 確保所有必要的欄位都存在
+            if "paused" not in game_data:
+                game_data["paused"] = False
     except:
-        game_data = {"teams": {"red": 0, "blue": 0}, "users": {}}
+        game_data = {"teams": {"red": 0, "blue": 0}, "users": {}, "paused": False}
 else:
-    game_data = {"teams": {"red": 0, "blue": 0}, "users": {}}
+    game_data = {"teams": {"red": 0, "blue": 0}, "users": {}, "paused": False}
 
 # 🟢 加在這裡
 LAST_EVENT_TIME = datetime.datetime.min
@@ -148,6 +151,12 @@ async def on_message(message):
     global LAST_EVENT_TIME
 
     if message.author.bot or message.webhook_id is not None or message.guild is None:
+        return
+
+    # 【新增：暫停功能檢查】
+    if game_data.get("paused", False) and not message.content.startswith("!"):
+        # 如果遊戲暫停，且不是在下指令，就直接跳過不加分
+        await bot.process_commands(message)
         return
 
     user_id = str(message.author.id)
@@ -370,6 +379,52 @@ async def status(ctx):
     embed.add_field(name="🔵 藍隊總計", value=f"人數：{blue_count} 人\n總分數：**{game_data['teams']['blue']}** 分", inline=True)
     
     await ctx.send(embed=embed)
+
+# --- 管理員指令：遊戲總回顧 ---
+@bot.command(name="report")
+@commands.has_permissions(administrator=True)
+async def game_report(ctx):
+    red_score = game_data["teams"]["red"]
+    blue_score = game_data["teams"]["blue"]
+    
+    # 統計總發言量
+    total_msgs = sum(u.get("total_msg", 0) for u in game_data["users"].values())
+    
+    embed = discord.Embed(title="📈 戰場總回顧報告", color=discord.Color.blue())
+    embed.add_field(name="🔴 紅隊積分", value=f"**{red_score}**", inline=True)
+    embed.add_field(name="🔵 藍隊積分", value=f"**{blue_score}**", inline=True)
+    embed.add_field(name="總參與發言", value=f"`{total_msgs}` 則", inline=False)
+    embed.add_field(name="狀態", value="遊戲進行中" if not game_data.get("paused", False) else "⚠️ 遊戲已暫停", inline=False)
+    
+    await ctx.send(embed=embed)
+
+# --- 管理員指令：暫停遊戲 ---
+@bot.command(name="pause")
+@commands.has_permissions(administrator=True)
+async def pause_game(ctx):
+    game_data["paused"] = not game_data.get("paused", False)
+    status = "暫停" if game_data["paused"] else "恢復"
+    save_data()
+    await ctx.send(f"⚙️ 遊戲狀態已更改：現在為 **{status}** 模式。")
+
+# --- 管理員指令：重置所有分數 ---
+@bot.command(name="reset_all")
+@commands.has_permissions(administrator=True)
+async def reset_all_data(ctx):
+    # 確認指令
+    await ctx.send("⚠️ 確定要清除所有隊伍分數與個人積分嗎？這無法復原！請回覆 'confirm' 確認。")
+    
+    def check(m): return m.author == ctx.author and m.content.lower() == "confirm"
+    
+    try:
+        await bot.wait_for('message', check=check, timeout=30.0)
+        game_data["teams"] = {"red": 0, "blue": 0}
+        game_data["users"] = {}
+        game_data["paused"] = False
+        save_data()
+        await ctx.send("✅ 已徹底清除所有數據庫！")
+    except:
+        await ctx.send("❌ 超時或取消，資料未重置。")
 
 # --- 6. 全新按鈕分類商店與通知系統 ---
 
