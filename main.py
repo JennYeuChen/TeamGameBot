@@ -380,22 +380,59 @@ async def status(ctx):
     
     await ctx.send(embed=embed)
 
-# --- 管理員指令：遊戲總回顧 ---
+# --- 即時戰況指令 ---
 @bot.command(name="report")
+async def report(ctx):
+    red = game_data["teams"]["red"]
+    blue = game_data["teams"]["blue"]
+    
+    # 計算進度條 (用文字視覺化)
+    total = red + blue if (red + blue) > 0 else 1
+    red_bar = int((red / total) * 10)
+    blue_bar = 10 - red_bar
+    progress = "🔴" * red_bar + "🔵" * blue_bar
+    
+    embed = discord.Embed(title="📊 戰況實況面板", color=discord.Color.blue())
+    embed.description = f"戰況比率：\n{progress}"
+    embed.add_field(name="🔴 紅隊", value=f"**{red}** 分", inline=True)
+    embed.add_field(name="🔵 藍隊", value=f"**{blue}** 分", inline=True)
+    embed.add_field(name="比賽狀態", value="暫停中 ⏸️" if game_data.get("paused", False) else "熱戰中 �", inline=False)
+    
+    await ctx.send(embed=embed)
+
+# --- 管理員指令：最終戰報 ---
+@bot.command(name="final_report")
 @commands.has_permissions(administrator=True)
-async def game_report(ctx):
-    red_score = game_data["teams"]["red"]
-    blue_score = game_data["teams"]["blue"]
+async def final_report(ctx):
+    red = game_data["teams"]["red"]
+    blue = game_data["teams"]["blue"]
     
-    # 統計總發言量
-    total_msgs = sum(u.get("total_msg", 0) for u in game_data["users"].values())
+    # 找尋全場 MVP (以 total_msg 為準)
+    users = game_data["users"]
+    top_user = max(users.items(), key=lambda x: x[1].get('total_msg', 0), default=(None, {"total_msg": 0}))
     
-    embed = discord.Embed(title="📈 戰場總回顧報告", color=discord.Color.blue())
-    embed.add_field(name="🔴 紅隊積分", value=f"**{red_score}**", inline=True)
-    embed.add_field(name="🔵 藍隊積分", value=f"**{blue_score}**", inline=True)
-    embed.add_field(name="總參與發言", value=f"`{total_msgs}` 則", inline=False)
-    embed.add_field(name="狀態", value="遊戲進行中" if not game_data.get("paused", False) else "⚠️ 遊戲已暫停", inline=False)
+    embed = discord.Embed(title="� 陣營對抗賽 - 最終戰報", color=discord.Color.gold())
+    embed.add_field(name="🔴 紅隊總分", value=f"**{red}**", inline=True)
+    embed.add_field(name="🔵 藍隊總分", value=f"**{blue}**", inline=True)
     
+    if red > blue:
+        winner = "🔴 紅隊"
+    elif blue > red:
+        winner = "🔵 藍隊"
+    else:
+        winner = "雙方平手"
+    
+    embed.add_field(name="🏆 最終勝負", value=f"由 {winner} 取得勝利！", inline=False)
+    
+    if top_user[0]:
+        try:
+            member = ctx.guild.get_member(int(top_user[0]))
+            name = member.display_name if member else "未知用戶"
+        except:
+            name = "未知用戶"
+        embed.add_field(name="🏅 全場 MVP (發言王)", value=f"{name} (共發言 {top_user[1].get('total_msg', 0)} 則)", inline=False)
+    
+    embed.set_footer(text="數據已封存，請管理員執行 !new_season 重啟")
     await ctx.send(embed=embed)
 
 # --- 管理員指令：暫停遊戲 ---
@@ -407,7 +444,37 @@ async def pause_game(ctx):
     save_data()
     await ctx.send(f"⚙️ 遊戲狀態已更改：現在為 **{status}** 模式。")
 
-# --- 管理員指令：重置所有分數 ---
+# --- 管理員指令：結束比賽 ---
+@bot.command(name="end_game")
+@commands.has_permissions(administrator=True)
+async def end_game(ctx):
+    game_data["paused"] = True  # 鎖定遊戲
+    save_data()
+    
+    red = game_data["teams"]["red"]
+    blue = game_data["teams"]["blue"]
+    winner = "🔴 紅隊獲勝！" if red > blue else "🔵 藍隊獲勝！" if blue > red else "平局！"
+    
+    await ctx.send(f"🏁 **比賽已結束！**\n最終比分：紅 {red} : 藍 {blue}\n恭喜：{winner}\n*(指令 !new_season 可清空數據準備下一次比賽)*")
+
+# --- 管理員指令：準備新賽季 ---
+@bot.command(name="new_season")
+@commands.has_permissions(administrator=True)
+async def new_season(ctx):
+    await ctx.send("⚠️ 準備開始新賽季？這將刪除所有積分與戰績。請在 30 秒內輸入 'confirm'。")
+    
+    def check(m): return m.author == ctx.author and m.content.lower() == "confirm"
+    try:
+        await bot.wait_for('message', check=check, timeout=30.0)
+        game_data["teams"] = {"red": 0, "blue": 0}
+        game_data["users"] = {}  # 重置個人資料
+        game_data["paused"] = False  # 開啟遊戲
+        save_data()
+        await ctx.send("🚀 **新賽季正式啟動！戰場積分已歸零。**")
+    except:
+        await ctx.send("❌ 取消重置，比賽保持原狀。")
+
+# --- 管理員指令：重置所有分數 (保留用於向後兼容) ---
 @bot.command(name="reset_all")
 @commands.has_permissions(administrator=True)
 async def reset_all_data(ctx):
